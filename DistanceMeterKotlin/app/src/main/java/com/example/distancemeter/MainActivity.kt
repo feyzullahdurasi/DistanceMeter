@@ -60,6 +60,7 @@ import androidx.core.content.ContextCompat
 import com.example.distancemeter.ui.theme.DistanceMeterTheme
 import java.io.IOException
 import java.io.InputStream
+import java.io.OutputStream
 import java.util.UUID
 
 class MainActivity : ComponentActivity() {
@@ -129,6 +130,7 @@ class MainActivity : ComponentActivity() {
                         wheelRadius = wheelRadius.value,
                         onConnectClick = { checkBluetoothPermissions() },
                         onResetClick = { resetDistance() },
+                        onAddRadiusClick = { addRadius() }, // Yarıçap Ekle butonu için callback
                         onDeviceClick = { device -> connectToDevice(device) },
                         onWheelRadiusChange = { updateWheelRadius(it) }
                     )
@@ -141,6 +143,34 @@ class MainActivity : ComponentActivity() {
         _wheelRadius.value = radius
         // Mevcut mesafeyi yeni yarıçapa göre güncelleyebiliriz
         updateDistanceDisplay(_distanceRaw.value)
+
+        // ESP32'ye yeni yarıçapı gönder
+        sendWheelRadiusToESP32(radius)
+    }
+
+    private fun sendWheelRadiusToESP32(radius: Double) {
+        if (bluetoothSocket?.isConnected == true) {
+            val command = "SET_RADIUS:${radius}"
+            connectedThread?.write(command)
+            _connectionStatus.value = "Yarıçap ESP32'ye gönderiliyor: $radius mm"
+            Log.d(TAG, "ESP32'ye yarıçap gönderiliyor: $radius mm")
+        } else {
+            _connectionStatus.value = "ESP32'ye bağlı değil, yarıçap güncellenemedi"
+            Log.d(TAG, "ESP32'ye bağlı değil, yarıçap güncellenemedi")
+        }
+    }
+
+    // Yarıçap ekleme fonksiyonu
+    private fun addRadius() {
+        if (bluetoothSocket?.isConnected == true) {
+            val command = "ADD_RADIUS"
+            connectedThread?.write(command)
+            _connectionStatus.value = "Mesafeye yarıçap (${_wheelRadius.value} mm) ekleniyor..."
+            Log.d(TAG, "ESP32'ye yarıçap ekleme komutu gönderiliyor")
+        } else {
+            _connectionStatus.value = "ESP32'ye bağlı değil, yarıçap eklenemedi"
+            Log.d(TAG, "ESP32'ye bağlı değil, yarıçap eklenemedi")
+        }
     }
 
     private fun checkBluetoothPermissions() {
@@ -258,6 +288,9 @@ class MainActivity : ComponentActivity() {
                 connectedThread = ConnectedThread(bluetoothSocket!!)
                 connectedThread?.start()
 
+                // Bağlantı kurulduktan sonra ESP32'den tekerlek yarıçapını iste
+                requestWheelRadiusFromESP32()
+
             } catch (e: IOException) {
                 Log.e(TAG, "Bağlantı hatası: ${e.message}")
                 runOnUiThread {
@@ -273,16 +306,26 @@ class MainActivity : ComponentActivity() {
         }.start()
     }
 
+    private fun requestWheelRadiusFromESP32() {
+        if (bluetoothSocket?.isConnected == true) {
+            connectedThread?.write("GET_RADIUS")
+            Log.d(TAG, "ESP32'den tekerlek yarıçapı istendi")
+        }
+    }
+
     private fun resetDistance() {
         // Mesafe değerini sıfırla - ESP32'ye reset komutu gönder
         if (bluetoothSocket?.isConnected == true) {
             connectedThread?.write("RESET")
-            _distanceRaw.value = 0.0
-            updateDistanceDisplay(0.0)
+            _connectionStatus.value = "Mesafe sıfırlanıyor..."
+            Log.d(TAG, "ESP32'ye sıfırlama komutu gönderildi")
         } else {
-            _distanceRaw.value = 0.0
-            updateDistanceDisplay(0.0)
+            _connectionStatus.value = "ESP32'ye bağlı değil, sıfırlama yapılamadı"
         }
+
+        // Yerel değerleri de sıfırla
+        _distanceRaw.value = 0.0
+        updateDistanceDisplay(0.0)
     }
 
     private fun updateDistanceDisplay(distanceInMeters: Double) {
@@ -313,18 +356,22 @@ class MainActivity : ComponentActivity() {
 
     private inner class ConnectedThread(private val mmSocket: BluetoothSocket) : Thread() {
         private val mmInStream: InputStream?
+        private val mmOutStream: OutputStream?
         private val handler = Handler(Looper.getMainLooper())
 
         init {
             var tmpIn: InputStream? = null
+            var tmpOut: OutputStream? = null
 
             try {
                 tmpIn = mmSocket.inputStream
+                tmpOut = mmSocket.outputStream
             } catch (e: IOException) {
-                Log.e(TAG, "Error occurred when creating input stream", e)
+                Log.e(TAG, "Error occurred when creating input/output streams", e)
             }
 
             mmInStream = tmpIn
+            mmOutStream = tmpOut
         }
 
         override fun run() {
@@ -345,16 +392,8 @@ class MainActivity : ComponentActivity() {
                             val line = readMessage.substring(0, endOfLineIndex).trim()
                             readMessage = readMessage.substring(endOfLineIndex + 1)
 
-                            try {
-                                val distanceInMeters = line.toFloat().toDouble()
-                                handler.post {
-                                    _distanceRaw.value = distanceInMeters
-                                    updateDistanceDisplay(distanceInMeters)
-                                }
-                            } catch (e: NumberFormatException) {
-                                // Geçersiz sayı formatı
-                                Log.e(TAG, "Geçersiz veri alındı: $line")
-                            }
+                            // Gelen cevabı işle
+                            processReceivedData(line)
                         }
                     }
                 } catch (e: IOException) {
@@ -367,12 +406,95 @@ class MainActivity : ComponentActivity() {
             }
         }
 
+        private fun processReceivedData(data: String) {
+            Log.d(TAG, "ESP32'den gelen veri: $data")
+
+            when {
+                // Mesafe değeri (sayısal değer)
+                data.toFloatOrNull() != null -> {
+                    try {
+                        val distanceInMeters = data.toFloat().toDouble()
+                        handler.post {
+                            _distanceRaw.value = distanceInMeters
+                            updateDistanceDisplay(distanceInMeters)
+                        }
+                    } catch (e: NumberFormatException) {
+                        Log.e(TAG, "Geçersiz mesafe verisi: $data")
+                    }
+                }
+
+                // Sıfırlama onayı
+                data == "RESET_OK" -> {
+                    handler.post {
+                        _connectionStatus.value = "Mesafe başarıyla sıfırlandı"
+                        _distanceRaw.value = 0.0
+                        updateDistanceDisplay(0.0)
+                    }
+                }
+
+                // Yarıçap yanıtı
+                data.startsWith("RADIUS:") -> {
+                    try {
+                        val radiusValue = data.substring(7).toFloat().toDouble()
+                        handler.post {
+                            _wheelRadius.value = radiusValue
+                            _connectionStatus.value = "ESP32'den yarıçap alındı: $radiusValue mm"
+                        }
+                    } catch (e: Exception) {
+                        Log.e(TAG, "Yarıçap değeri işlenemedi: $data", e)
+                    }
+                }
+
+                // Yarıçap ayarlama onayı
+                data.startsWith("RADIUS_OK:") -> {
+                    try {
+                        val radiusValue = data.substring(10).toFloat().toDouble()
+                        handler.post {
+                            _wheelRadius.value = radiusValue
+                            _connectionStatus.value = "Yarıçap ESP32'de ayarlandı: $radiusValue mm"
+                        }
+                    } catch (e: Exception) {
+                        Log.e(TAG, "Yarıçap onayı işlenemedi: $data", e)
+                    }
+                }
+
+                // Yarıçap ekleme onayı
+                data.startsWith("RADIUS_ADDED:") -> {
+                    try {
+                        val radiusValue = data.substring(13).toFloat().toDouble()
+                        handler.post {
+                            _connectionStatus.value = "Mesafeye yarıçap eklendi: $radiusValue mm"
+                        }
+                    } catch (e: Exception) {
+                        Log.e(TAG, "Yarıçap ekleme onayı işlenemedi: $data", e)
+                    }
+                }
+
+                // Yarıçap ayarlama hatası
+                data.startsWith("RADIUS_ERROR:") -> {
+                    val errorMsg = data.substring(13)
+                    handler.post {
+                        _connectionStatus.value = "Yarıçap ayarlama hatası: $errorMsg"
+                    }
+                }
+
+                // Diğer yanıtlar
+                else -> {
+                    Log.d(TAG, "Tanımlanamayan ESP32 yanıtı: $data")
+                }
+            }
+        }
+
         // Cihaza veri gönder
         fun write(input: String) {
             try {
-                mmSocket.outputStream.write(input.toByteArray())
+                mmOutStream?.write((input + "\n").toByteArray())
+                Log.d(TAG, "ESP32'ye gönderilen veri: $input")
             } catch (e: IOException) {
-                Log.e(TAG, "Error occurred when sending data", e)
+                Log.e(TAG, "Veri gönderilirken hata oluştu", e)
+                handler.post {
+                    _connectionStatus.value = "Veri gönderme hatası: ${e.message}"
+                }
             }
         }
 
@@ -397,239 +519,211 @@ fun DistanceMeterApp(
     wheelRadius: Double,
     onConnectClick: () -> Unit,
     onResetClick: () -> Unit,
+    onAddRadiusClick: () -> Unit,
     onDeviceClick: (BluetoothDevice) -> Unit,
     onWheelRadiusChange: (Double) -> Unit
 ) {
     var wheelRadiusInput by rememberSaveable { mutableStateOf(wheelRadius.toString()) }
     var isEditing by remember { mutableStateOf(false) }
 
-    Column(
-        modifier = modifier
-            .fillMaxSize()
-            .padding(16.dp),
-        horizontalAlignment = Alignment.CenterHorizontally
+    Surface(
+        modifier = modifier.fillMaxSize(),
+        color = MaterialTheme.colorScheme.background
     ) {
-        // Başlık
-        Text(
-            text = "Tekerlek Mesafe Ölçer",
-            fontSize = 24.sp,
-            fontWeight = FontWeight.Bold,
-            modifier = Modifier.padding(vertical = 12.dp)
-        )
-
-        // Tekerlek Yarıçapı Ayarı
-        Card(
+        Column(
+            horizontalAlignment = Alignment.CenterHorizontally,
+            verticalArrangement = Arrangement.spacedBy(16.dp),
             modifier = Modifier
-                .fillMaxWidth()
-                .padding(vertical = 8.dp),
-            elevation = CardDefaults.cardElevation(defaultElevation = 4.dp),
-            shape = RoundedCornerShape(12.dp),
-            colors = CardDefaults.cardColors(
-                containerColor = MaterialTheme.colorScheme.primaryContainer.copy(alpha = 0.4f)
-            )
+                .padding(horizontal = 24.dp, vertical = 32.dp)
+                .fillMaxSize()
         ) {
-            Column(
-                modifier = Modifier.padding(16.dp),
-                horizontalAlignment = Alignment.CenterHorizontally
+            // Başlık
+            Text(
+                text = "Mesafe Ölçer",
+                style = MaterialTheme.typography.headlineLarge,
+                color = MaterialTheme.colorScheme.onBackground
+            )
+
+            // Tekerlek Yarıçapı Ayarı
+            Card(
+                modifier = Modifier.fillMaxWidth(),
+                shape = RoundedCornerShape(16.dp),
+                colors = CardDefaults.cardColors(
+                    containerColor = MaterialTheme.colorScheme.primaryContainer
+                ),
+                elevation = CardDefaults.cardElevation(defaultElevation = 4.dp)
             ) {
-                Text(
-                    text = "Tekerlek Yarıçapı",
-                    fontWeight = FontWeight.Bold,
-                    fontSize = 16.sp,
-                    color = MaterialTheme.colorScheme.onPrimaryContainer
-                )
-
-                Spacer(modifier = Modifier.height(8.dp))
-
-                Row(
-                    verticalAlignment = Alignment.CenterVertically,
-                    horizontalArrangement = Arrangement.SpaceBetween,
-                    modifier = Modifier.fillMaxWidth()
+                Column(
+                    modifier = Modifier.padding(16.dp),
+                    horizontalAlignment = Alignment.CenterHorizontally
                 ) {
-                    if (isEditing) {
-                        OutlinedTextField(
-                            value = wheelRadiusInput,
-                            onValueChange = { newValue ->
-                                // Sadece sayıları ve nokta işaretini kabul et
-                                if (newValue.isEmpty() || newValue.matches(Regex("^\\d*\\.?\\d*$"))) {
-                                    wheelRadiusInput = newValue
-                                }
-                            },
-                            label = { Text("Yarıçap (mm)") },
-                            keyboardOptions = KeyboardOptions(keyboardType = KeyboardType.Number),
-                            modifier = Modifier.weight(1f)
-                        )
-
-                        Spacer(modifier = Modifier.width(8.dp))
-
-                        Button(onClick = {
-                            try {
+                    Text(
+                        text = "Tekerlek Yarıçapı",
+                        style = MaterialTheme.typography.titleMedium,
+                        color = MaterialTheme.colorScheme.onPrimaryContainer
+                    )
+                    Spacer(modifier = Modifier.height(8.dp))
+                    Row(
+                        verticalAlignment = Alignment.CenterVertically,
+                        horizontalArrangement = Arrangement.spacedBy(8.dp),
+                        modifier = Modifier.fillMaxWidth()
+                    ) {
+                        if (isEditing) {
+                            OutlinedTextField(
+                                value = wheelRadiusInput,
+                                onValueChange = { newValue ->
+                                    if (newValue.isEmpty() || newValue.matches(Regex("^\\d*\\.?\\d*$"))) {
+                                        wheelRadiusInput = newValue
+                                    }
+                                },
+                                label = { Text("Yarıçap (mm)") },
+                                keyboardOptions = KeyboardOptions(keyboardType = KeyboardType.Number),
+                                modifier = Modifier.weight(1f)
+                            )
+                            Button(onClick = {
                                 val radiusValue = wheelRadiusInput.toDoubleOrNull() ?: wheelRadius
                                 if (radiusValue > 0) {
                                     onWheelRadiusChange(radiusValue)
                                     isEditing = false
+                                } else {
+                                    // Burada kullanıcıya geçersiz bir değer girildiği konusunda geri bildirim verilebilir.
+                                    wheelRadiusInput = wheelRadius.toString()
                                 }
-                            } catch (e: Exception) {
-                                // Geçersiz değer durumunda varsayılan değere geri dön
-                                wheelRadiusInput = wheelRadius.toString()
+                            }) {
+                                Text("Kaydet")
                             }
-                        }) {
-                            Text("Kaydet")
-                        }
-                    } else {
-                        Text(
-                            text = "$wheelRadius mm",
-                            fontSize = 20.sp,
-                            fontWeight = FontWeight.Bold,
-                            color = MaterialTheme.colorScheme.onPrimaryContainer,
-                            modifier = Modifier.weight(1f)
-                        )
-
-                        Button(onClick = { isEditing = true }) {
-                            Text("Değiştir")
+                        } else {
+                            Text(
+                                text = "$wheelRadius mm",
+                                style = MaterialTheme.typography.bodyLarge,
+                                color = MaterialTheme.colorScheme.onPrimaryContainer,
+                                modifier = Modifier.weight(1f)
+                            )
+                            Button(onClick = { isEditing = true }) {
+                                Text("Düzenle")
+                            }
                         }
                     }
                 }
             }
-        }
 
-        // Mesafe göstergesi kartı
-        Card(
-            modifier = Modifier
-                .fillMaxWidth()
-                .padding(vertical = 12.dp),
-            elevation = CardDefaults.cardElevation(defaultElevation = 6.dp),
-            shape = RoundedCornerShape(16.dp),
-            colors = CardDefaults.cardColors(
-                containerColor = MaterialTheme.colorScheme.secondaryContainer
-            )
-        ) {
-            Column(
-                modifier = Modifier.padding(24.dp),
-                horizontalAlignment = Alignment.CenterHorizontally
+            // Mesafe Göstergesi
+            Card(
+                modifier = Modifier.fillMaxWidth(),
+                shape = RoundedCornerShape(16.dp),
+                colors = CardDefaults.cardColors(
+                    containerColor = MaterialTheme.colorScheme.secondaryContainer
+                ),
+                elevation = CardDefaults.cardElevation(defaultElevation = 6.dp)
             ) {
-                Text(
-                    text = "Toplam Ölçülen Mesafe",
-                    fontSize = 18.sp,
-                    color = MaterialTheme.colorScheme.onSecondaryContainer
-                )
-
-                Spacer(modifier = Modifier.height(16.dp))
-
-                Row(
-                    verticalAlignment = Alignment.Bottom,
-                    horizontalArrangement = Arrangement.Center,
-                    modifier = Modifier.fillMaxWidth()
+                Column(
+                    modifier = Modifier.padding(vertical = 24.dp, horizontal = 16.dp),
+                    horizontalAlignment = Alignment.CenterHorizontally
                 ) {
                     Text(
-                        text = distanceFormatted,
-                        fontSize = 48.sp,
-                        fontWeight = FontWeight.Bold,
+                        text = "Ölçülen Mesafe",
+                        style = MaterialTheme.typography.titleLarge,
                         color = MaterialTheme.colorScheme.onSecondaryContainer
                     )
-
-                    Spacer(modifier = Modifier.width(8.dp))
-
-                    Text(
-                        text = distanceUnit,
-                        fontSize = 24.sp,
-                        color = MaterialTheme.colorScheme.onSecondaryContainer.copy(alpha = 0.7f),
-                        modifier = Modifier.padding(bottom = 8.dp)
-                    )
+                    Spacer(modifier = Modifier.height(16.dp))
+                    Row(
+                        verticalAlignment = Alignment.Bottom,
+                        horizontalArrangement = Arrangement.Center,
+                        modifier = Modifier.fillMaxWidth()
+                    ) {
+                        Text(
+                            text = distanceFormatted,
+                            style = MaterialTheme.typography.displayMedium,
+                            color = MaterialTheme.colorScheme.onSecondaryContainer
+                        )
+                        Spacer(modifier = Modifier.width(8.dp))
+                        Text(
+                            text = distanceUnit,
+                            style = MaterialTheme.typography.headlineSmall,
+                            color = MaterialTheme.colorScheme.onSecondaryContainer.copy(alpha = 0.7f),
+                            modifier = Modifier.padding(bottom = 8.dp)
+                        )
+                    }
                 }
             }
-        }
 
-        // Bağlantı durumu
-        Surface(
-            modifier = Modifier
-                .fillMaxWidth()
-                .padding(vertical = 8.dp),
-            shape = RoundedCornerShape(8.dp),
-            color = MaterialTheme.colorScheme.surface,
-            tonalElevation = 2.dp
-        ) {
+            // Bağlantı Durumu
             Text(
                 text = connectionStatus,
-                fontSize = 16.sp,
-                textAlign = TextAlign.Center,
-                modifier = Modifier.padding(12.dp)
+                style = MaterialTheme.typography.bodyMedium,
+                color = MaterialTheme.colorScheme.onBackground,
+                modifier = Modifier
+                    .fillMaxWidth()
+                    .padding(vertical = 8.dp),
+                textAlign = TextAlign.Center
             )
-        }
 
-        // Butonlar
-        Row(
-            modifier = Modifier
-                .fillMaxWidth()
-                .padding(vertical = 12.dp),
-            horizontalArrangement = Arrangement.SpaceBetween
-        ) {
-            Button(
-                onClick = onConnectClick,
-                modifier = Modifier.weight(1f)
+            // Butonlar
+            Row(
+                modifier = Modifier.fillMaxWidth(),
+                horizontalArrangement = Arrangement.spacedBy(8.dp)
             ) {
-                Text("Bluetooth Bağlantısı")
-            }
-
-            Spacer(modifier = Modifier.width(8.dp))
-
-            Button(
-                onClick = onResetClick,
-                modifier = Modifier.weight(0.5f)
-            ) {
-                Text("Sıfırla")
-            }
-        }
-
-        // Divider
-        Divider(
-            modifier = Modifier
-                .fillMaxWidth()
-                .padding(vertical = 8.dp),
-            color = MaterialTheme.colorScheme.outlineVariant
-        )
-
-        // Cihaz listesi başlığı
-        Text(
-            text = "Eşleştirilmiş Cihazlar",
-            fontSize = 16.sp,
-            fontWeight = FontWeight.Bold,
-            modifier = Modifier
-                .fillMaxWidth()
-                .padding(vertical = 8.dp)
-        )
-
-        // Cihaz listesi
-        LazyColumn(
-            modifier = Modifier
-                .fillMaxWidth()
-                .weight(1f)
-        ) {
-            items(deviceList) { device ->
-                val deviceName = if (ActivityCompat.checkSelfPermission(
-                        LocalContext.current,
-                        Manifest.permission.BLUETOOTH_CONNECT
-                    ) == PackageManager.PERMISSION_GRANTED
-                ) {
-                    device.name ?: "Bilinmeyen Cihaz"
-                } else {
-                    "İzin Gerekli"
-                }
-
-                val deviceAddress = device.address
-
-                Card(
-                    modifier = Modifier
-                        .fillMaxWidth()
-                        .padding(vertical = 4.dp),
-                    elevation = CardDefaults.cardElevation(defaultElevation = 2.dp),
+                Button(
+                    onClick = onConnectClick,
+                    modifier = Modifier.weight(1f),
                     shape = RoundedCornerShape(8.dp)
                 ) {
-                    ListItem(
-                        headlineContent = { Text(deviceName, fontWeight = FontWeight.Medium) },
-                        supportingContent = { Text(deviceAddress, fontSize = 14.sp) },
-                        modifier = Modifier.clickable { onDeviceClick(device) }
-                    )
+                    Text("Bluetooth")
+                }
+                Button(
+                    onClick = onResetClick,
+                    modifier = Modifier.weight(0.6f),
+                    shape = RoundedCornerShape(8.dp)
+                ) {
+                    Text("Sıfırla")
+                }
+            }
+            Button(
+                onClick = onAddRadiusClick,
+                modifier = Modifier.fillMaxWidth(),
+                shape = RoundedCornerShape(8.dp)
+            ) {
+                Text("Yarıçap Ekle (+ $wheelRadius mm)")
+            }
+
+            Spacer(modifier = Modifier.height(16.dp))
+
+            // Eşleştirilmiş Cihazlar Listesi
+            Text(
+                text = "Eşleştirilmiş Cihazlar",
+                style = MaterialTheme.typography.titleMedium,
+                color = MaterialTheme.colorScheme.onBackground,
+                modifier = Modifier.fillMaxWidth(),
+                textAlign = TextAlign.Start
+            )
+            LazyColumn(
+                modifier = Modifier
+                    .fillMaxWidth()
+                    .weight(1f)
+            ) {
+                items(deviceList) { device ->
+                    val deviceName = if (ActivityCompat.checkSelfPermission(
+                            LocalContext.current,
+                            Manifest.permission.BLUETOOTH_CONNECT
+                        ) == PackageManager.PERMISSION_GRANTED
+                    ) {
+                        device.name ?: "Bilinmeyen Cihaz"
+                    } else {
+                        "İzin Gerekli"
+                    }
+                    Card(
+                        modifier = Modifier
+                            .fillMaxWidth()
+                            .padding(vertical = 4.dp),
+                        shape = RoundedCornerShape(8.dp),
+                        elevation = CardDefaults.cardElevation(defaultElevation = 2.dp)
+                    ) {
+                        ListItem(
+                            headlineContent = { Text(deviceName) },
+                            supportingContent = { Text(device.address) },
+                            modifier = Modifier.clickable { onDeviceClick(device) }
+                        )
+                    }
                 }
             }
         }
